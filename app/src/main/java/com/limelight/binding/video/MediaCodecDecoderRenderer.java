@@ -80,6 +80,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private boolean foreground = true;
     private PerfOverlayListener perfListener;
     private boolean forceAmlogicFullRangeDecode;
+    private boolean forceAmlogicHevcFullRangeStream;
 
     private static final int CR_MAX_TRIES = 10;
     private static final int CR_RECOVERY_TYPE_NONE = 0;
@@ -315,9 +316,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.perfListener = perfListener;
         this.forceAmlogicFullRangeDecode =
                 !prefs.fullRange && MediaCodecHelper.shouldForceAmlogicFullRangeDecodeWorkaround();
+        this.forceAmlogicHevcFullRangeStream =
+                forceAmlogicFullRangeDecode &&
+                prefs.videoFormat == PreferenceConfiguration.FormatOption.FORCE_HEVC;
 
         if (forceAmlogicFullRangeDecode) {
             LimeLog.warning("Forcing full-range H.264 decoder metadata for affected Amlogic HDMI output path");
+        }
+        if (forceAmlogicHevcFullRangeStream) {
+            LimeLog.warning("Forcing full-range HEVC stream metadata for affected Amlogic HDMI output path");
         }
 
         this.activeWindowVideoStats = new VideoStats();
@@ -455,7 +462,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     public int getPreferredColorRange() {
-        if (prefs.fullRange) {
+        if (prefs.fullRange || forceAmlogicHevcFullRangeStream) {
             return MoonBridge.COLOR_RANGE_FULL;
         }
         else {
@@ -488,6 +495,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 ", transfer=" + getFormatIntegerString(format, MediaFormat.KEY_COLOR_TRANSFER));
     }
 
+    private boolean shouldForceAmlogicFullRangeDecodeForMime(String mimeType) {
+        // The workaround patches H.264 SPS VUI below. Applying the matching MediaFormat override to
+        // HEVC can leave the decoder configured as full-range while the bitstream parses as limited.
+        return forceAmlogicFullRangeDecode && "video/avc".equals(mimeType);
+    }
+
     public void notifyVideoForeground() {
         foreground = true;
     }
@@ -517,7 +530,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         // Android 7.0 adds color options to the MediaFormat
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             videoFormat.setInteger(MediaFormat.KEY_COLOR_RANGE,
-                    getPreferredColorRange() == MoonBridge.COLOR_RANGE_FULL || forceAmlogicFullRangeDecode ?
+                    getPreferredColorRange() == MoonBridge.COLOR_RANGE_FULL ||
+                            shouldForceAmlogicFullRangeDecodeForMime(mimeType) ?
                     MediaFormat.COLOR_RANGE_FULL : MediaFormat.COLOR_RANGE_LIMITED);
 
             // If the stream is HDR-capable, the decoder will detect transitions in color standards
