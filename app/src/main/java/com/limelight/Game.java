@@ -30,6 +30,7 @@ import com.limelight.nvstream.jni.MoonBridge;
 import com.limelight.preferences.GlPreferences;
 import com.limelight.preferences.PreferenceConfiguration;
 import com.limelight.ui.GameGestures;
+import com.limelight.ui.StreamTextureView;
 import com.limelight.ui.StreamView;
 import com.limelight.utils.Dialog;
 import com.limelight.utils.ServerHelper;
@@ -52,6 +53,7 @@ import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Point;
 import android.graphics.Rect;
+import android.graphics.SurfaceTexture;
 import android.hardware.input.InputManager;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
@@ -60,6 +62,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
+import android.preference.PreferenceManager;
 import android.util.Rational;
 import android.view.Display;
 import android.view.InputDevice;
@@ -68,6 +71,7 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
+import android.view.TextureView;
 import android.view.View;
 import android.view.View.OnGenericMotionListener;
 import android.view.View.OnSystemUiVisibilityChangeListener;
@@ -88,7 +92,7 @@ import java.security.cert.X509Certificate;
 import java.util.Locale;
 
 
-public class Game extends Activity implements SurfaceHolder.Callback,
+public class Game extends Activity implements SurfaceHolder.Callback, TextureView.SurfaceTextureListener,
         OnGenericMotionListener, OnTouchListener, NvConnectionListener, EvdevListener,
         OnSystemUiVisibilityChangeListener, GameGestures, StreamView.InputCallbacks,
         PerfOverlayListener, UsbDriverService.UsbDriverStateListener, View.OnKeyListener {
@@ -136,7 +140,11 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private boolean cursorVisible = false;
     private boolean waitingForAllModifiersUp = false;
     private int specialKeyCode = KeyEvent.KEYCODE_UNKNOWN;
-    private StreamView streamView;
+    private View streamView;
+    private StreamView surfaceStreamView;
+    private StreamTextureView textureStreamView;
+    private Surface textureRenderSurface;
+    private boolean useTextureRenderTarget;
     private long lastAbsTouchUpTime = 0;
     private long lastAbsTouchDownTime = 0;
     private float lastAbsTouchUpX, lastAbsTouchUpY;
@@ -146,6 +154,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private TextView notificationOverlayView;
     private int requestedNotificationOverlayVisibility = View.GONE;
     private TextView performanceOverlayView;
+    private View gpuCompositionWorkaroundView;
+    private boolean gpuCompositionWorkaroundEnabled;
+    private boolean gpuCompositionToggle;
 
     private MediaCodecDecoderRenderer decoderRenderer;
     private boolean reportedCrash;
@@ -180,6 +191,22 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     public static final String EXTRA_PC_NAME = "PcName";
     public static final String EXTRA_APP_HDR = "HDR";
     public static final String EXTRA_SERVER_CERT = "ServerCert";
+
+    private static final String DEBUG_FORCE_GPU_COMPOSITION_PREF = "debug_force_amlogic_gpu_composition";
+    private static final String DEBUG_DISABLE_GPU_COMPOSITION_PREF = "debug_disable_amlogic_gpu_composition";
+
+    private final Runnable gpuCompositionWorkaroundRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!gpuCompositionWorkaroundEnabled || gpuCompositionWorkaroundView == null || !connected) {
+                return;
+            }
+
+            gpuCompositionToggle = !gpuCompositionToggle;
+            gpuCompositionWorkaroundView.setAlpha(gpuCompositionToggle ? 0.004f : 0.006f);
+            gpuCompositionWorkaroundView.postDelayed(this, 1000);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -218,6 +245,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         // Read the stream preferences
         prefConfig = PreferenceConfiguration.readPreferences(this);
         tombstonePrefs = Game.this.getSharedPreferences("DecoderTombstone", 0);
+        GlPreferences glPrefs = GlPreferences.readPreferences(this);
+        MediaCodecHelper.initialize(this, glPrefs.glRenderer);
+        configureAmlogicRenderWorkaround();
 
         // Enter landscape unless we're on a square screen
         setPreferredOrientationForCurrentDisplay();
@@ -235,11 +265,25 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             }
         }
 
+        surfaceStreamView = findViewById(R.id.surfaceView);
+        textureStreamView = findViewById(R.id.textureView);
+
+        if (useTextureRenderTarget) {
+            LimeLog.info("Using TextureView render target for Amlogic GPU composition workaround");
+            surfaceStreamView.setVisibility(View.GONE);
+            textureStreamView.setVisibility(View.VISIBLE);
+            streamView = textureStreamView;
+        }
+        else {
+            surfaceStreamView.setVisibility(View.VISIBLE);
+            textureStreamView.setVisibility(View.GONE);
+            streamView = surfaceStreamView;
+        }
+
         // Listen for non-touch events on the game surface
-        streamView = findViewById(R.id.surfaceView);
         streamView.setOnGenericMotionListener(this);
         streamView.setOnKeyListener(this);
-        streamView.setInputCallbacks(this);
+        setStreamInputCallbacks(this);
 
         // Listen for touch events on the background touch view to enable trackpad mode
         // to work on areas outside of the StreamView itself. We use a separate View
@@ -271,6 +315,8 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         notificationOverlayView = findViewById(R.id.notificationOverlay);
 
         performanceOverlayView = findViewById(R.id.performanceOverlay);
+        gpuCompositionWorkaroundView = findViewById(R.id.gpuCompositionWorkaround);
+        configureGpuCompositionWorkaround();
 
         inputCaptureProvider = InputCaptureManager.getInputCaptureProvider(this, this);
 
@@ -334,10 +380,6 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             finish();
             return;
         }
-
-        // Initialize the MediaCodec helper before creating the decoder
-        GlPreferences glPrefs = GlPreferences.readPreferences(this);
-        MediaCodecHelper.initialize(this, glPrefs.glRenderer);
 
         // Check if the user has enabled HDR
         boolean willStreamHdr = false;
@@ -531,8 +573,17 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             return;
         }
 
-        // The connection will be started when the surface gets created
-        streamView.getHolder().addCallback(this);
+        // The connection will be started when the render target gets created
+        if (useTextureRenderTarget) {
+            textureStreamView.setSurfaceTextureListener(this);
+            if (textureStreamView.isAvailable()) {
+                onSurfaceTextureAvailable(textureStreamView.getSurfaceTexture(),
+                        textureStreamView.getWidth(), textureStreamView.getHeight());
+            }
+        }
+        else {
+            surfaceStreamView.getHolder().addCallback(this);
+        }
     }
 
     private void setPreferredOrientationForCurrentDisplay() {
@@ -597,6 +648,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
                 performanceOverlayView.setVisibility(View.GONE);
                 notificationOverlayView.setVisibility(View.GONE);
+                setGpuCompositionWorkaroundVisible(false);
 
                 // Disable sensors while in PiP mode
                 controllerHandler.disableSensors();
@@ -618,6 +670,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 }
 
                 notificationOverlayView.setVisibility(requestedNotificationOverlayVisibility);
+                setGpuCompositionWorkaroundVisible(connected);
 
                 // Enable sensors again after exiting PiP
                 controllerHandler.enableSensors();
@@ -944,12 +997,15 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         }
 
         if (prefConfig.stretchVideo || aspectRatioMatch) {
-            // Set the surface to the size of the video
-            streamView.getHolder().setFixedSize(prefConfig.width, prefConfig.height);
+            if (!useTextureRenderTarget) {
+                // Set the surface to the size of the video
+                surfaceStreamView.getHolder().setFixedSize(prefConfig.width, prefConfig.height);
+            }
+            setStreamDesiredAspectRatio(0);
         }
         else {
             // Set the surface to scale based on the aspect ratio of the stream
-            streamView.setDesiredAspectRatio((double)prefConfig.width / (double)prefConfig.height);
+            setStreamDesiredAspectRatio((double)prefConfig.width / (double)prefConfig.height);
         }
 
         // Set the desired refresh rate that will get passed into setFrameRate() later
@@ -1051,6 +1107,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // Destroy the capture provider
         inputCaptureProvider.destroy();
+        stopGpuCompositionWorkaround();
     }
 
     @Override
@@ -2210,6 +2267,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         if (connecting || connected) {
             connecting = connected = false;
             updatePipAutoEnter();
+            stopGpuCompositionWorkaround();
 
             controllerHandler.stop();
 
@@ -2248,7 +2306,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                     LimeLog.severe(stage + " failed: " + errorCode);
 
                     // If video initialization failed and the surface is still valid, display extra information for the user
-                    if (stage.contains("video") && streamView.getHolder().getSurface().isValid()) {
+                    if (stage.contains("video") && isRenderSurfaceValid()) {
                         Toast.makeText(Game.this, getResources().getText(R.string.video_decoder_init_failed), Toast.LENGTH_LONG).show();
                     }
 
@@ -2281,6 +2339,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             public void run() {
                 // Let the display go to sleep now
                 getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                stopGpuCompositionWorkaround();
 
                 // Stop processing controller input
                 controllerHandler.stop();
@@ -2411,6 +2470,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
                 // Keep the display on
                 getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                startGpuCompositionWorkaround();
 
                 // Update GameManager state to indicate we're in game
                 UiHelper.notifyStreamConnected(Game.this);
@@ -2483,62 +2543,85 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         controllerHandler.handleSetControllerLED(controllerNumber, r, g, b);
     }
 
-    @Override
-    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        if (!surfaceCreated) {
-            throw new IllegalStateException("Surface changed before creation!");
+    private void setStreamInputCallbacks(StreamView.InputCallbacks callbacks) {
+        if (useTextureRenderTarget) {
+            textureStreamView.setInputCallbacks(callbacks);
+        }
+        else {
+            surfaceStreamView.setInputCallbacks(callbacks);
+        }
+    }
+
+    private void setStreamDesiredAspectRatio(double aspectRatio) {
+        if (useTextureRenderTarget) {
+            textureStreamView.setDesiredAspectRatio(aspectRatio);
+        }
+        else {
+            surfaceStreamView.setDesiredAspectRatio(aspectRatio);
+        }
+    }
+
+    private void setTextureDefaultBufferSize(SurfaceTexture surfaceTexture) {
+        if (surfaceTexture != null) {
+            surfaceTexture.setDefaultBufferSize(prefConfig.width, prefConfig.height);
+        }
+    }
+
+    private void applyFrameRateToRenderSurface(Surface surface) {
+        float desiredFrameRate;
+
+        // Android will pick the lowest matching refresh rate for a given frame rate value, so we want
+        // to report the true FPS value if refresh rate reduction is enabled. We also report the true
+        // FPS value if there's no suitable matching refresh rate.
+        if (mayReduceRefreshRate() || desiredRefreshRate < prefConfig.fps) {
+            desiredFrameRate = prefConfig.fps;
+        }
+        else {
+            desiredFrameRate = desiredRefreshRate;
         }
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            surface.setFrameRate(desiredFrameRate,
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                    Surface.CHANGE_FRAME_RATE_ALWAYS);
+        }
+        else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            surface.setFrameRate(desiredFrameRate,
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+        }
+    }
+
+    private void handleRenderSurfaceCreated(Surface surface) {
+        surfaceCreated = true;
+        if (surface != null && surface.isValid()) {
+            applyFrameRateToRenderSurface(surface);
+        }
+    }
+
+    private void startConnectionWithRenderSurface(Surface surface) {
         if (!attemptedConnection) {
             attemptedConnection = true;
 
             // Update GameManager state to indicate we're "loading" while connecting
             UiHelper.notifyStreamConnecting(Game.this);
 
-            decoderRenderer.setRenderTarget(holder);
+            decoderRenderer.setRenderTarget(surface);
             conn.start(new AndroidAudioRenderer(Game.this, prefConfig.enableAudioFx),
                     decoderRenderer, Game.this);
         }
     }
 
-    @Override
-    public void surfaceCreated(SurfaceHolder holder) {
-        float desiredFrameRate;
-
-        surfaceCreated = true;
-
-        // Android will pick the lowest matching refresh rate for a given frame rate value, so we want
-        // to report the true FPS value if refresh rate reduction is enabled. We also report the true
-        // FPS value if there's no suitable matching refresh rate. In that case, Android could try to
-        // select a lower refresh rate that avoids uneven pull-down (ex: 30 Hz for a 60 FPS stream on
-        // a display that maxes out at 50 Hz).
-        if (mayReduceRefreshRate() || desiredRefreshRate < prefConfig.fps) {
-            desiredFrameRate = prefConfig.fps;
+    private boolean isRenderSurfaceValid() {
+        if (useTextureRenderTarget) {
+            return textureRenderSurface != null && textureRenderSurface.isValid();
         }
         else {
-            // Otherwise, we will pretend that our frame rate matches the refresh rate we picked in
-            // prepareDisplayForRendering(). This will usually be the highest refresh rate that our
-            // frame rate evenly divides into, which ensures the lowest possible display latency.
-            desiredFrameRate = desiredRefreshRate;
-        }
-
-        // Tell the OS about our frame rate to allow it to adapt the display refresh rate appropriately
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // We want to change frame rate even if it's not seamless, since prepareDisplayForRendering()
-            // will not set the display mode on S+ if it only differs by the refresh rate. It depends
-            // on us to trigger the frame rate switch here.
-            holder.getSurface().setFrameRate(desiredFrameRate,
-                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
-                    Surface.CHANGE_FRAME_RATE_ALWAYS);
-        }
-        else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            holder.getSurface().setFrameRate(desiredFrameRate,
-                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+            Surface surface = surfaceStreamView.getHolder().getSurface();
+            return surface != null && surface.isValid();
         }
     }
 
-    @Override
-    public void surfaceDestroyed(SurfaceHolder holder) {
+    private void handleRenderSurfaceDestroyed() {
         if (!surfaceCreated) {
             throw new IllegalStateException("Surface destroyed before creation!");
         }
@@ -2551,6 +2634,58 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 stopConnection();
             }
         }
+
+        surfaceCreated = false;
+    }
+
+    @Override
+    public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        if (!surfaceCreated) {
+            throw new IllegalStateException("Surface changed before creation!");
+        }
+
+        startConnectionWithRenderSurface(holder.getSurface());
+    }
+
+    @Override
+    public void surfaceCreated(SurfaceHolder holder) {
+        handleRenderSurfaceCreated(holder.getSurface());
+    }
+
+    @Override
+    public void surfaceDestroyed(SurfaceHolder holder) {
+        handleRenderSurfaceDestroyed();
+    }
+
+    @Override
+    public void onSurfaceTextureAvailable(SurfaceTexture surfaceTexture, int width, int height) {
+        setTextureDefaultBufferSize(surfaceTexture);
+        textureRenderSurface = new Surface(surfaceTexture);
+        handleRenderSurfaceCreated(textureRenderSurface);
+        startConnectionWithRenderSurface(textureRenderSurface);
+    }
+
+    @Override
+    public void onSurfaceTextureSizeChanged(SurfaceTexture surfaceTexture, int width, int height) {
+        setTextureDefaultBufferSize(surfaceTexture);
+    }
+
+    @Override
+    public boolean onSurfaceTextureDestroyed(SurfaceTexture surfaceTexture) {
+        if (surfaceCreated) {
+            handleRenderSurfaceDestroyed();
+        }
+
+        if (textureRenderSurface != null) {
+            textureRenderSurface.release();
+            textureRenderSurface = null;
+        }
+
+        return true;
+    }
+
+    @Override
+    public void onSurfaceTextureUpdated(SurfaceTexture surfaceTexture) {
     }
 
     @Override
@@ -2644,6 +2779,66 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                 performanceOverlayView.setText(text);
             }
         });
+    }
+
+    private void configureAmlogicRenderWorkaround() {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        boolean forced = prefs.getBoolean(DEBUG_FORCE_GPU_COMPOSITION_PREF, false);
+        boolean disabled = prefs.getBoolean(DEBUG_DISABLE_GPU_COMPOSITION_PREF, false);
+
+        useTextureRenderTarget =
+                (forced || MediaCodecHelper.shouldUseAmlogicGpuCompositionWorkaround()) && !disabled;
+
+        if (useTextureRenderTarget) {
+            LimeLog.info("Amlogic TextureView render workaround enabled" + (forced ? " by debug flag" : ""));
+        }
+        else if (disabled) {
+            LimeLog.info("Amlogic render workaround disabled by debug flag");
+        }
+    }
+
+    private void configureGpuCompositionWorkaround() {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        boolean forced = prefs.getBoolean(DEBUG_FORCE_GPU_COMPOSITION_PREF, false);
+        boolean disabled = prefs.getBoolean(DEBUG_DISABLE_GPU_COMPOSITION_PREF, false);
+
+        gpuCompositionWorkaroundEnabled =
+                !useTextureRenderTarget &&
+                (forced || MediaCodecHelper.shouldUseAmlogicGpuCompositionWorkaround()) && !disabled;
+
+        if (gpuCompositionWorkaroundEnabled) {
+            LimeLog.info("Amlogic overlay composition workaround enabled" + (forced ? " by debug flag" : ""));
+        }
+        else if (useTextureRenderTarget) {
+            LimeLog.info("Amlogic overlay composition workaround skipped because TextureView is active");
+        }
+    }
+
+    private void setGpuCompositionWorkaroundVisible(boolean visible) {
+        if (!gpuCompositionWorkaroundEnabled || gpuCompositionWorkaroundView == null) {
+            return;
+        }
+
+        gpuCompositionWorkaroundView.setVisibility(visible ? View.VISIBLE : View.GONE);
+    }
+
+    private void startGpuCompositionWorkaround() {
+        if (!gpuCompositionWorkaroundEnabled || gpuCompositionWorkaroundView == null) {
+            return;
+        }
+
+        gpuCompositionWorkaroundView.removeCallbacks(gpuCompositionWorkaroundRunnable);
+        gpuCompositionToggle = false;
+        gpuCompositionWorkaroundView.setAlpha(0.004f);
+        setGpuCompositionWorkaroundVisible(true);
+        gpuCompositionWorkaroundView.postDelayed(gpuCompositionWorkaroundRunnable, 1000);
+    }
+
+    private void stopGpuCompositionWorkaround() {
+        if (gpuCompositionWorkaroundView != null) {
+            gpuCompositionWorkaroundView.removeCallbacks(gpuCompositionWorkaroundRunnable);
+            gpuCompositionWorkaroundView.setVisibility(View.GONE);
+        }
     }
 
     @Override

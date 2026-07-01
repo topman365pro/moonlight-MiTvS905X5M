@@ -21,6 +21,7 @@ import android.os.CombinedVibration;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
@@ -33,6 +34,7 @@ import android.view.MotionEvent;
 import android.view.Surface;
 import android.widget.Toast;
 
+import com.limelight.BuildConfig;
 import com.limelight.LimeLog;
 import com.limelight.R;
 import com.limelight.binding.input.driver.AbstractController;
@@ -51,6 +53,7 @@ import org.cgutman.shieldcontrollerextensions.SceConnectionType;
 import org.cgutman.shieldcontrollerextensions.SceManager;
 
 import java.lang.reflect.InvocationTargetException;
+import java.util.Locale;
 import java.util.Map;
 
 public class ControllerHandler implements InputManager.InputDeviceListener, UsbDriverListener {
@@ -68,6 +71,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
     private static final short MAX_GAMEPADS = 16; // Limited by bits in activeGamepadMask
 
     private static final int BATTERY_RECHECK_INTERVAL_MS = 120 * 1000;
+    private static final int CONTROLLER_LATENCY_LOG_INTERVAL_MS = 1000;
 
     private static final Map<Integer, Integer> ANDROID_TO_LI_BUTTON_MAP = Map.ofEntries(
             Map.entry(KeyEvent.KEYCODE_BUTTON_A, ControllerPacket.A_FLAG),
@@ -720,6 +724,8 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         context.name = devName;
         context.id = dev.getId();
         context.external = isExternal(dev);
+        context.likelyBluetooth = devName.toLowerCase(Locale.US).contains("wireless") ||
+                devName.toLowerCase(Locale.US).contains("bluetooth");
 
         context.vendorId = dev.getVendorId();
         context.productId = dev.getProductId();
@@ -1063,6 +1069,39 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         }
     }
 
+    private void markInputEvent(GenericControllerContext context, long eventTimeMs, String eventType) {
+        context.lastInputEventTimeMs = eventTimeMs;
+        context.lastInputEventType = eventType;
+    }
+
+    private void logControllerInputLatency(GenericControllerContext context) {
+        if (!BuildConfig.DEBUG || context.lastInputEventTimeMs == 0 || context.vendorId != 0x054c) {
+            return;
+        }
+
+        long now = SystemClock.uptimeMillis();
+        if (now - context.lastInputLatencyLogTimeMs < CONTROLLER_LATENCY_LOG_INTERVAL_MS) {
+            return;
+        }
+
+        context.lastInputLatencyLogTimeMs = now;
+        String name = "(unknown)";
+        boolean likelyBluetooth = false;
+        if (context instanceof InputDeviceContext) {
+            InputDeviceContext inputDeviceContext = (InputDeviceContext) context;
+            name = inputDeviceContext.name;
+            likelyBluetooth = inputDeviceContext.likelyBluetooth;
+        }
+
+        LimeLog.info("Controller latency debug: device=\"" + name + "\"" +
+                ", vid=0x" + Integer.toHexString(context.vendorId) +
+                ", pid=0x" + Integer.toHexString(context.productId) +
+                ", event=" + context.lastInputEventType +
+                ", eventToSendMs=" + (now - context.lastInputEventTimeMs) +
+                ", external=" + context.external +
+                ", likelyBluetooth=" + likelyBluetooth);
+    }
+
     private short getActiveControllerMask() {
         if (prefConfig.multiController) {
             return (short)(currentControllers | initialControllers | (prefConfig.onscreenController ? 1 : 0));
@@ -1302,6 +1341,8 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
                     leftStickX, leftStickY,
                     rightStickX, rightStickY);
         }
+
+        logControllerInputLatency(originalContext);
     }
 
     private final int REMAP_IGNORE = -1;
@@ -1803,6 +1844,8 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         if (context == null) {
             return true;
         }
+
+        markInputEvent(context, event.getEventTime(), "motion");
 
         float lsX = 0, lsY = 0, rsX = 0, rsY = 0, rt = 0, lt = 0, hatX = 0, hatY = 0;
 
@@ -2339,6 +2382,8 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             keyCode = handleFlipFaceButtons(keyCode);
         }
 
+        markInputEvent(context, event.getEventTime(), "key-up");
+
         // If the button hasn't been down long enough, sleep for a bit before sending the up event
         // This allows "instant" button presses (like OUYA's virtual menu button) to work. This
         // path should not be triggered during normal usage.
@@ -2575,6 +2620,8 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         if (prefConfig.flipFaceButtons) {
             keyCode = handleFlipFaceButtons(keyCode);
         }
+
+        markInputEvent(context, event.getEventTime(), "key-down");
 
         switch (keyCode) {
         case KeyEvent.KEYCODE_BUTTON_MODE:
@@ -2887,6 +2934,10 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         public short leftStickX = 0x0000;
         public short leftStickY = 0x0000;
 
+        public long lastInputEventTimeMs;
+        public long lastInputLatencyLogTimeMs;
+        public String lastInputEventType = "unknown";
+
         public boolean mouseEmulationActive;
         public int mouseEmulationLastInputMap;
         public final int mouseEmulationReportPeriod = 50;
@@ -2988,6 +3039,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         public boolean hasJoystickAxes;
         public boolean pendingExit;
         public boolean isDualShockStandaloneTouchpad;
+        public boolean likelyBluetooth;
 
         public int emulatingButtonFlags = 0;
         public boolean hasSelect;

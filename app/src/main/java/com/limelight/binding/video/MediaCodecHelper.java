@@ -13,6 +13,7 @@ import java.util.regex.Pattern;
 import android.annotation.SuppressLint;
 import android.app.ActivityManager;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.content.pm.ConfigurationInfo;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
@@ -50,6 +51,9 @@ public class MediaCodecHelper {
 
     private static boolean isLowEndSnapdragon = false;
     private static boolean isAdreno620 = false;
+    private static boolean isAmlogicAndroidTv14OrNewer = false;
+    private static boolean isAmlogicS905X5MFamily = false;
+    private static boolean isAmlogicRfiSafe = false;
     private static boolean initialized = false;
 
     static {
@@ -255,6 +259,64 @@ public class MediaCodecHelper {
         return glRenderer.toLowerCase().contains("powervr");
     }
 
+    private static boolean containsIgnoreCase(String value, String needle) {
+        return value != null && value.toLowerCase(Locale.US).contains(needle.toLowerCase(Locale.US));
+    }
+
+    private static boolean isAmlogicBuild() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (containsIgnoreCase(Build.SOC_MANUFACTURER, "amlogic") ||
+                    containsIgnoreCase(Build.SOC_MODEL, "amlogic")) {
+                return true;
+            }
+        }
+
+        return containsIgnoreCase(Build.HARDWARE, "amlogic") ||
+                containsIgnoreCase(Build.BOARD, "amlogic") ||
+                containsIgnoreCase(Build.DEVICE, "amlogic") ||
+                containsIgnoreCase(Build.PRODUCT, "amlogic");
+    }
+
+    private static boolean isKnownAmlogicAndroidTvBoxModel() {
+        String buildInfo = Build.MANUFACTURER + " " + Build.MODEL + " " +
+                Build.DEVICE + " " + Build.PRODUCT;
+
+        return containsIgnoreCase(buildInfo, "mi box") ||
+                containsIgnoreCase(buildInfo, "mibox") ||
+                containsIgnoreCase(buildInfo, "mitv") ||
+                containsIgnoreCase(buildInfo, "afmu") ||
+                containsIgnoreCase(buildInfo, "onn") ||
+                containsIgnoreCase(buildInfo, "x88");
+    }
+
+    private static boolean isS905X5MFamilyBuild() {
+        String buildInfo = Build.BOARD + " " + Build.DEVICE + " " + Build.HARDWARE + " " +
+                Build.MODEL + " " + Build.PRODUCT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            buildInfo += " " + Build.SOC_MODEL;
+        }
+
+        return containsIgnoreCase(buildInfo, "s905x5") ||
+                containsIgnoreCase(buildInfo, "s905xm5") ||
+                containsIgnoreCase(buildInfo, "x5m") ||
+                containsIgnoreCase(buildInfo, "afmu");
+    }
+
+    private static String getAmlogicBuildSummary() {
+        String summary = "manufacturer=" + Build.MANUFACTURER +
+                ", model=" + Build.MODEL +
+                ", device=" + Build.DEVICE +
+                ", product=" + Build.PRODUCT +
+                ", board=" + Build.BOARD +
+                ", hardware=" + Build.HARDWARE;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            summary += ", soc=" + Build.SOC_MANUFACTURER + "/" + Build.SOC_MODEL;
+        }
+
+        return summary;
+    }
+
     private static String getAdrenoVersionString(String glRenderer) {
         glRenderer = glRenderer.toLowerCase().trim();
 
@@ -309,6 +371,19 @@ public class MediaCodecHelper {
             return;
         }
 
+        boolean isAndroidTv = context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
+                context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_TELEVISION);
+        isAmlogicAndroidTv14OrNewer = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+                isAndroidTv && (isAmlogicBuild() || isKnownAmlogicAndroidTvBoxModel());
+        isAmlogicS905X5MFamily = isAmlogicAndroidTv14OrNewer && isS905X5MFamilyBuild();
+
+        if (isAmlogicAndroidTv14OrNewer) {
+            LimeLog.info("Detected Amlogic Android TV 14+ device: " + getAmlogicBuildSummary());
+            if (isAmlogicS905X5MFamily) {
+                LimeLog.info("Detected S905X5M-family device; enabling Amlogic streaming workarounds");
+            }
+        }
+
         // Older Sony ATVs (SVP-DTV15) have broken MediaTek codecs (decoder hangs after rendering the first frame).
         // I know the Fire TV 2 and 3 works, so I'll whitelist Amazon devices which seem to actually be tested.
         // We still have to check Build.MANUFACTURER to catch Amazon Fire tablets.
@@ -338,6 +413,7 @@ public class MediaCodecHelper {
             // Cubes and Fire TV 3. This check will exclude the Fire TV 3 and Fire TV Cube 1, but
             // allow the newer Fire TV Cubes to use HEVC RFI.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                isAmlogicRfiSafe = true;
                 refFrameInvalidationHevcPrefixes.add("omx.amlogic");
                 refFrameInvalidationHevcPrefixes.add("c2.amlogic");
             }
@@ -430,6 +506,36 @@ public class MediaCodecHelper {
         }
         
         return false;
+    }
+
+    public static boolean shouldUseAmlogicGpuCompositionWorkaround() {
+        if (!initialized) {
+            throw new IllegalStateException("MediaCodecHelper must be initialized before use");
+        }
+
+        return isAmlogicAndroidTv14OrNewer;
+    }
+
+    public static boolean shouldForceAmlogicFullRangeDecodeWorkaround() {
+        if (!initialized) {
+            throw new IllegalStateException("MediaCodecHelper must be initialized before use");
+        }
+
+        return isAmlogicAndroidTv14OrNewer;
+    }
+
+    public static boolean decoderIsAmlogic(MediaCodecInfo decoderInfo) {
+        return decoderInfo != null && isDecoderInList(amlogicDecoderPrefixes, decoderInfo.getName());
+    }
+
+    public static boolean shouldDisableAmlogicHevcByDefault(MediaCodecInfo decoderInfo) {
+        if (decoderInfo == null || !isAmlogicAndroidTv14OrNewer) {
+            return false;
+        }
+
+        String decoderName = decoderInfo.getName();
+        return decoderName.toLowerCase(Locale.US).startsWith("c2.amlogic") &&
+                decoderName.toLowerCase(Locale.US).contains("hevc");
     }
 
     private static boolean decoderSupportsAndroidRLowLatency(MediaCodecInfo decoderInfo, String mimeType) {
@@ -684,6 +790,11 @@ public class MediaCodecHelper {
         // buffering frames.
         if (decoderSupportsAndroidRLowLatency(decoderInfo, "video/hevc") ||
                 decoderSupportsKnownVendorLowLatencyOption(decoderInfo.getName())) {
+            if (decoderIsAmlogic(decoderInfo) && !isAmlogicRfiSafe) {
+                LimeLog.info("Not enabling HEVC RFI on unconfirmed Amlogic decoder: " + decoderInfo.getName());
+                return false;
+            }
+
             LimeLog.info("Enabling HEVC RFI based on low latency option support");
             return true;
         }
@@ -715,6 +826,11 @@ public class MediaCodecHelper {
         }
         else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && (!decoderInfo.isHardwareAccelerated() || decoderInfo.isSoftwareOnly())) {
             LimeLog.info("Disallowing HEVC on software decoder: " + decoderInfo.getName());
+            return false;
+        }
+
+        if (shouldDisableAmlogicHevcByDefault(decoderInfo)) {
+            LimeLog.info("Disallowing HEVC by default on affected Amlogic Android TV decoder: " + decoderInfo.getName());
             return false;
         }
 

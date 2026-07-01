@@ -35,6 +35,7 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.util.Range;
 import android.view.Choreographer;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 
 public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements Choreographer.FrameCallback {
@@ -70,7 +71,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private boolean refFrameInvalidationActive;
     private int initialWidth, initialHeight;
     private int videoFormat;
-    private SurfaceHolder renderTarget;
+    private Surface renderTarget;
     private volatile boolean stopping;
     private CrashListener crashListener;
     private boolean reportedCrash;
@@ -78,6 +79,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private String glRenderer;
     private boolean foreground = true;
     private PerfOverlayListener perfListener;
+    private boolean forceAmlogicFullRangeDecode;
 
     private static final int CR_MAX_TRIES = 10;
     private static final int CR_RECOVERY_TYPE_NONE = 0;
@@ -291,6 +293,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     public void setRenderTarget(SurfaceHolder renderTarget) {
+        this.renderTarget = renderTarget.getSurface();
+    }
+
+    public void setRenderTarget(Surface renderTarget) {
         this.renderTarget = renderTarget;
     }
 
@@ -307,6 +313,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.consecutiveCrashCount = consecutiveCrashCount;
         this.glRenderer = glRenderer;
         this.perfListener = perfListener;
+        this.forceAmlogicFullRangeDecode =
+                !prefs.fullRange && MediaCodecHelper.shouldForceAmlogicFullRangeDecodeWorkaround();
+
+        if (forceAmlogicFullRangeDecode) {
+            LimeLog.warning("Forcing full-range H.264 decoder metadata for affected Amlogic HDMI output path");
+        }
 
         this.activeWindowVideoStats = new VideoStats();
         this.lastWindowVideoStats = new VideoStats();
@@ -451,6 +463,31 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
 
+    private static String getFormatIntegerString(MediaFormat format, String key) {
+        if (format == null || !format.containsKey(key)) {
+            return "(unset)";
+        }
+
+        try {
+            return String.valueOf(format.getInteger(key));
+        } catch (ClassCastException e) {
+            return "(invalid)";
+        } catch (NullPointerException e) {
+            return "(invalid)";
+        }
+    }
+
+    private static void logMediaFormatColor(String label, MediaFormat format) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return;
+        }
+
+        LimeLog.info(label + " color metadata: range=" +
+                getFormatIntegerString(format, MediaFormat.KEY_COLOR_RANGE) +
+                ", standard=" + getFormatIntegerString(format, MediaFormat.KEY_COLOR_STANDARD) +
+                ", transfer=" + getFormatIntegerString(format, MediaFormat.KEY_COLOR_TRANSFER));
+    }
+
     public void notifyVideoForeground() {
         foreground = true;
     }
@@ -480,7 +517,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         // Android 7.0 adds color options to the MediaFormat
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             videoFormat.setInteger(MediaFormat.KEY_COLOR_RANGE,
-                    getPreferredColorRange() == MoonBridge.COLOR_RANGE_FULL ?
+                    getPreferredColorRange() == MoonBridge.COLOR_RANGE_FULL || forceAmlogicFullRangeDecode ?
                     MediaFormat.COLOR_RANGE_FULL : MediaFormat.COLOR_RANGE_LIMITED);
 
             // If the stream is HDR-capable, the decoder will detect transitions in color standards
@@ -502,6 +539,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
         }
 
+        logMediaFormatColor("Requested decoder", videoFormat);
         return videoFormat;
     }
 
@@ -536,8 +574,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         LimeLog.info("Configuring with format: "+format);
+        logMediaFormatColor("Configuring decoder", format);
 
-        videoDecoder.configure(format, renderTarget.getSurface(), null, 0);
+        videoDecoder.configure(format, renderTarget, null, 0);
 
         configuredFormat = format;
 
@@ -551,6 +590,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             // This will contain the actual accepted input format attributes
             inputFormat = videoDecoder.getInputFormat();
             LimeLog.info("Input format: "+inputFormat);
+            logMediaFormatColor("Accepted input", inputFormat);
         }
 
         videoDecoder.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
@@ -1135,6 +1175,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                     LimeLog.info("Output format changed");
                                     outputFormat = videoDecoder.getOutputFormat();
                                     LimeLog.info("New output format: " + outputFormat);
+                                    logMediaFormatColor("Decoder output", outputFormat);
                                     break;
                                 default:
                                     break;
@@ -1522,6 +1563,22 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 if (!refFrameInvalidationActive) {
                     LimeLog.info("Patching num_ref_frames in SPS");
                     sps.numRefFrames = 1;
+                }
+
+                if (forceAmlogicFullRangeDecode) {
+                    if (sps.vuiParams == null) {
+                        LimeLog.info("Adding VUI parameters for Amlogic full-range decode workaround");
+                        sps.vuiParams = new VUIParameters();
+                    }
+
+                    LimeLog.warning("Patching H.264 SPS VUI to full range for Amlogic HDMI output workaround");
+                    sps.vuiParams.videoSignalTypePresentFlag = true;
+                    sps.vuiParams.videoFormat = 5; // Unspecified
+                    sps.vuiParams.videoFullRangeFlag = true;
+                    sps.vuiParams.colourDescriptionPresentFlag = true;
+                    sps.vuiParams.colourPrimaries = 1; // BT.709
+                    sps.vuiParams.transferCharacteristics = 1; // BT.709
+                    sps.vuiParams.matrixCoefficients = 1; // BT.709
                 }
 
                 // GFE 2.5.11 changed the SPS to add additional extensions. Some devices don't like these
