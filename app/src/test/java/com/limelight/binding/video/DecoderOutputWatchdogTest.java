@@ -14,7 +14,7 @@ public final class DecoderOutputWatchdogTest {
         // Normal streaming, including an output frame racing ahead of the next input report.
         for (long time = 0; time < 10000; time += 16) {
             check(!watchdog.onInput(time), "Healthy output must prevent recovery");
-            watchdog.reset();
+            check(!watchdog.onOutput(time + 8, 8), "Healthy frames must not trigger latency recovery");
         }
 
         // The captured failure: input keeps succeeding but no output appears.
@@ -62,6 +62,40 @@ public final class DecoderOutputWatchdogTest {
             }
             watchdog.reset();
         }
+        // Flowing output can still be stale. Require sustained lateness, not a single spike.
+        watchdog.reset();
+        for (long time = 0; time < 1000; time += 16) {
+            check(!watchdog.onInput(time), "Flowing output must not trip the no-output guard");
+            check(!watchdog.onOutput(time, 200), "Allow one second before latency recovery");
+        }
+        watchdog.onInput(1008);
+        check(watchdog.onOutput(1008, 200), "Sustained stale output must trigger recovery");
+        watchdog.reset();
+        watchdog.onInput(1024);
+        check(!watchdog.onOutput(1024, 200), "Reset must clear accumulated lateness");
+
+        // Isolated late frames, invalid timestamps, and gaps cannot accumulate a false alarm.
+        watchdog.reset();
+        for (long time = 0; time < 5000; time += 16) {
+            watchdog.onInput(time);
+            check(!watchdog.onOutput(time, time % 160 == 0 ? 500 : 10), "Ignore isolated spikes");
+        }
+        watchdog.reset();
+        for (long time = 0; time < 2000; time += 16) {
+            watchdog.onInput(time);
+            check(!watchdog.onOutput(time, -1), "Ignore invalid frame ages");
+        }
+        watchdog.reset();
+        watchdog.onInput(0);
+        for (long time = 1000; time < 3000; time += 16) {
+            check(!watchdog.onOutput(time, 2000), "Draining after network silence is not a live stall");
+        }
+
+        // The native decode queue should be refreshed only when a valid timestamp is stale.
+        check(!DecoderOutputWatchdog.isQueuedFrameStale(1150, 1000), "Allow 150 ms exactly");
+        check(DecoderOutputWatchdog.isQueuedFrameStale(1151, 1000), "Reject stale queued frames");
+        check(!DecoderOutputWatchdog.isQueuedFrameStale(1000, 0), "Ignore unset enqueue time");
+        check(!DecoderOutputWatchdog.isQueuedFrameStale(1000, 1001), "Ignore future enqueue time");
         System.out.println("DecoderOutputWatchdog regression tests passed");
     }
 }

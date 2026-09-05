@@ -130,6 +130,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
     private boolean stopped = false;
 
     private final PreferenceConfiguration prefConfig;
+    private final boolean logInputLatency;
     private short currentControllers, initialControllers;
 
     public ControllerHandler(Activity activityContext, NvConnection conn, GameGestures gestures, PreferenceConfiguration prefConfig) {
@@ -137,6 +138,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
         this.conn = conn;
         this.gestures = gestures;
         this.prefConfig = prefConfig;
+        this.logInputLatency = BuildConfig.DEBUG && prefConfig.enablePerfOverlay;
         this.deviceVibrator = (Vibrator) activityContext.getSystemService(Context.VIBRATOR_SERVICE);
         this.deviceSensorManager = (SensorManager) activityContext.getSystemService(Context.SENSOR_SERVICE);
         this.inputManager = (InputManager) activityContext.getSystemService(Context.INPUT_SERVICE);
@@ -1070,12 +1072,15 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
     }
 
     private void markInputEvent(GenericControllerContext context, long eventTimeMs, String eventType) {
+        if (!logInputLatency) {
+            return;
+        }
         context.lastInputEventTimeMs = eventTimeMs;
         context.lastInputEventType = eventType;
     }
 
     private void logControllerInputLatency(GenericControllerContext context) {
-        if (!BuildConfig.DEBUG || context.lastInputEventTimeMs == 0 || context.vendorId != 0x054c) {
+        if (!logInputLatency || context.lastInputEventTimeMs == 0 || context.vendorId != 0x054c) {
             return;
         }
 

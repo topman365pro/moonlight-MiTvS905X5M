@@ -933,7 +933,9 @@ public class Game extends Activity implements SurfaceHolder.Callback, TextureVie
                 // If we only changed refresh rate and we're on an OS that supports Surface.setFrameRate()
                 // use that instead of using preferredDisplayModeId to avoid the possibility of triggering
                 // bugs that can cause the system to switch from 4K60 to 4K24 on Chromecast 4K.
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                // TextureView's decoder Surface is not owned by SurfaceFlinger, so its
+                // setFrameRate() hint is ignored. Apply the chosen display mode explicitly.
+                if (useTextureRenderTarget || Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
                         display.getMode().getPhysicalWidth() != bestMode.getPhysicalWidth() ||
                         display.getMode().getPhysicalHeight() != bestMode.getPhysicalHeight()) {
                     // Apply the display mode change
@@ -2568,6 +2570,10 @@ public class Game extends Activity implements SurfaceHolder.Callback, TextureVie
     }
 
     private void applyFrameRateToRenderSurface(Surface surface) {
+        if (useTextureRenderTarget) {
+            // prepareDisplayForRendering() applies the mode to the window for this path.
+            return;
+        }
         float desiredFrameRate;
 
         // Android will pick the lowest matching refresh rate for a given frame rate value, so we want

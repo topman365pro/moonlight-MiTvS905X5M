@@ -83,6 +83,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private boolean forceAmlogicHevcFullRangeStream;
     private boolean outputWatchdogEnabled;
     private final DecoderOutputWatchdog outputWatchdog = new DecoderOutputWatchdog();
+    private volatile long latestDecodeQueueDelayMs;
+    private volatile long latestAssemblyDelayMs;
+    // Accessed only by the renderer thread. Diagnostics are emitted once per five seconds.
+    private long latencyReportStartMs;
+    private long latencyReportAgeSumMs;
+    private long latencyReportMaxAgeMs;
+    private int latencyReportFrames;
 
     private static final int CR_MAX_TRIES = 10;
     private static final int CR_RECOVERY_TYPE_NONE = 0;
@@ -364,6 +371,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         int hevcOptimalSlicesPerFrame = 0;
         if (avcDecoder != null) {
             directSubmit = MediaCodecHelper.decoderCanDirectSubmit(avcDecoder.getName());
+            // Capabilities are negotiated before the active codec is known. HEVC may use
+            // Amlogic even when the selected AVC decoder comes from a different vendor.
+            if (MediaCodecHelper.shouldUseAmlogicGpuCompositionWorkaround() &&
+                    MediaCodecHelper.decoderIsAmlogic(hevcDecoder)) {
+                directSubmit = false;
+            }
+            if (!directSubmit && MediaCodecHelper.shouldUseAmlogicGpuCompositionWorkaround()) {
+                LimeLog.info("Separating Amlogic decoder submission from video packet reception");
+            }
             refFrameInvalidationAvc = MediaCodecHelper.decoderSupportsRefFrameInvalidationAvc(avcDecoder.getName(), prefs.height);
             avcOptimalSlicesPerFrame = MediaCodecHelper.getDecoderOptimalSlicesPerFrame(avcDecoder.getName());
 
@@ -1118,7 +1134,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         // Try to output a frame
                         int outIndex = videoDecoder.dequeueOutputBuffer(info, 50000);
                         if (outIndex >= 0) {
-                            outputWatchdog.reset();
                             long presentationTimeUs = info.presentationTimeUs;
                             int lastIndex = outIndex;
 
@@ -1129,7 +1144,6 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 // Get the last output buffer in the queue
                                 while ((outIndex = videoDecoder.dequeueOutputBuffer(info, 0)) >= 0) {
                                     videoDecoder.releaseOutputBuffer(lastIndex, false);
-                                    outputWatchdog.reset();
 
                                     numFramesOut++;
 
@@ -1186,6 +1200,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
                             // Add delta time to the totals (excluding probable outliers)
                             long delta = SystemClock.uptimeMillis() - (presentationTimeUs / 1000);
+                            if (outputWatchdogEnabled) {
+                                if (outputWatchdog.onOutput(SystemClock.uptimeMillis(), delta)) {
+                                    requestOutputRecovery("decoded frames remain over 150 ms old for one second");
+                                }
+                                reportLocalVideoLatency(delta);
+                            }
                             if (delta >= 0 && delta < 1000) {
                                 activeWindowVideoStats.decoderTimeMs += delta;
                                 if (!USE_FRAME_RENDER_TIME) {
@@ -1397,6 +1417,51 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     }
 
+    private void requestOutputRecovery(String reason) {
+        synchronized (codecRecoveryMonitor) {
+            // Serialize with prepareForStop(): never leave a recovery pending after shutdown.
+            if (stopping || codecRecoveryType.get() != CR_RECOVERY_TYPE_NONE) {
+                return;
+            }
+            if (codecRecoveryAttempts >= CR_MAX_TRIES) {
+                IllegalStateException exception = new IllegalStateException(
+                        "Amlogic decoder recovery limit reached: " + reason);
+                if (!reportedCrash) {
+                    reportedCrash = true;
+                    crashListener.notifyCrash(exception);
+                }
+                throw new RendererException(this, exception);
+            }
+            if (codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_NONE, CR_RECOVERY_TYPE_RESET)) {
+                LimeLog.warning("Amlogic HEVC " + reason + "; resetting decoder and requesting IDR");
+            }
+        }
+    }
+
+    private void reportLocalVideoLatency(long frameAgeMs) {
+        if (!BuildConfig.DEBUG || frameAgeMs < 0) {
+            return;
+        }
+        long nowMs = SystemClock.uptimeMillis();
+        if (latencyReportStartMs == 0) {
+            latencyReportStartMs = nowMs;
+        }
+        latencyReportAgeSumMs += frameAgeMs;
+        latencyReportMaxAgeMs = Math.max(latencyReportMaxAgeMs, frameAgeMs);
+        latencyReportFrames++;
+        if (nowMs - latencyReportStartMs >= 5000) {
+            long rtt = MoonBridge.getEstimatedRttInfo();
+            LimeLog.info("Local video latency: enqueue-to-output avg/max=" +
+                    latencyReportAgeSumMs / latencyReportFrames + "/" + latencyReportMaxAgeMs +
+                    " ms, latest decode queue=" + latestDecodeQueueDelayMs +
+                    " ms, latest assembly=" + latestAssemblyDelayMs +
+                    " ms, RTT=" + (rtt >> 32) + " ms, variance=" + (int) rtt + " ms");
+            latencyReportStartMs = nowMs;
+            latencyReportAgeSumMs = latencyReportMaxAgeMs = 0;
+            latencyReportFrames = 0;
+        }
+    }
+
     private boolean queueNextInputBuffer(long timestampUs, int codecFlags) {
         boolean codecRecovered;
 
@@ -1414,23 +1479,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             // Ignore CSD: only successfully submitted picture data proves input is progressing.
             if (outputWatchdogEnabled && (codecFlags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 &&
                     outputWatchdog.onInput(SystemClock.uptimeMillis())) {
-                synchronized (codecRecoveryMonitor) {
-                    // Serialize with prepareForStop() so shutdown cannot leave a new recovery pending.
-                    if (!stopping && codecRecoveryType.get() == CR_RECOVERY_TYPE_NONE) {
-                        if (codecRecoveryAttempts >= CR_MAX_TRIES) {
-                            DecoderHungException exception = new DecoderHungException(2000);
-                            if (!reportedCrash) {
-                                reportedCrash = true;
-                                crashListener.notifyCrash(exception);
-                            }
-                            throw new RendererException(this, exception);
-                        }
-                        if (codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_NONE, CR_RECOVERY_TYPE_RESET)) {
-                            LimeLog.warning("Amlogic HEVC output stalled for 2 seconds while input continues; " +
-                                    "resetting decoder and requesting IDR");
-                        }
-                    }
-                }
+                requestOutputRecovery("output stalled for 2 seconds while input continues");
             }
         } catch (IllegalStateException e) {
             if (handleDecoderException(e)) {
@@ -1490,6 +1539,19 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (stopping) {
             // Don't bother if we're stopping
             return MoonBridge.DR_OK;
+        }
+
+        if (outputWatchdogEnabled && lastFrameNumber != frameNumber) {
+            long nowMs = SystemClock.uptimeMillis();
+            latestDecodeQueueDelayMs = Math.max(0, nowMs - enqueueTimeMs);
+            latestAssemblyDelayMs = Math.max(0, enqueueTimeMs - receiveTimeMs);
+            if (DecoderOutputWatchdog.isQueuedFrameStale(nowMs, enqueueTimeMs)) {
+                // DR_NEED_IDR flushes the native frame queue and requests a clean reference
+                // frame. Arbitrarily dropping a P-frame and continuing would corrupt decoding.
+                LimeLog.warning("Discarding stale Amlogic decode queue (" + latestDecodeQueueDelayMs +
+                        " ms); requesting IDR to catch up");
+                return MoonBridge.DR_NEED_IDR;
+            }
         }
 
         if (lastFrameNumber == 0) {

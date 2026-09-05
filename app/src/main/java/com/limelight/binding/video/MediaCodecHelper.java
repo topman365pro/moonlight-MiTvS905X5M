@@ -743,6 +743,11 @@ public class MediaCodecHelper {
     }
 
     public static boolean decoderCanDirectSubmit(String decoderName) {
+        // Amlogic Codec2 input calls and recovery can block. Keep its codec work on the
+        // existing decoder thread so UDP reception can continue during those pauses.
+        if (isAmlogicAndroidTv14OrNewer && isDecoderInList(amlogicDecoderPrefixes, decoderName)) {
+            return false;
+        }
         return isDecoderInList(directSubmitPrefixes, decoderName) && !isExynos4Device();
     }
     
