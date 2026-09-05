@@ -9,6 +9,14 @@ public final class DecoderOutputWatchdogTest {
     }
 
     public static void main(String[] args) {
+        VideoTimestampNormalizer timestamps = new VideoTimestampNormalizer();
+        check(timestamps.normalize(9000000000L, 1000) == 1000000L, "Normalize an arbitrary native epoch");
+        long queuedMs = timestamps.normalize(9000016000L, 1300) / 1000;
+        check(queuedMs == 1016, "Retain queue delay instead of rebasing every frame");
+        check(DecoderOutputWatchdog.isQueuedFrameStale(1300, queuedMs), "Detect stale microsecond timestamps after normalization");
+        timestamps = new VideoTimestampNormalizer();
+        timestamps.normalize(1000000, 1000);
+        check(timestamps.normalize(1016000, 1300) == 1016000, "A zero offset is still initialized");
         DecoderOutputWatchdog watchdog = new DecoderOutputWatchdog();
 
         // Normal streaming, including an output frame racing ahead of the next input report.
