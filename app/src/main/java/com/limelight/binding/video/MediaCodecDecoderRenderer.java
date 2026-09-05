@@ -81,6 +81,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private PerfOverlayListener perfListener;
     private boolean forceAmlogicFullRangeDecode;
     private boolean forceAmlogicHevcFullRangeStream;
+    private boolean outputWatchdogEnabled;
+    private final DecoderOutputWatchdog outputWatchdog = new DecoderOutputWatchdog();
 
     private static final int CR_MAX_TRIES = 10;
     private static final int CR_RECOVERY_TYPE_NONE = 0;
@@ -714,6 +716,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             return -3;
         }
 
+        outputWatchdogEnabled = "video/hevc".equals(mimeType) &&
+                MediaCodecHelper.decoderIsAmlogic(selectedDecoderInfo) &&
+                MediaCodecHelper.shouldUseAmlogicGpuCompositionWorkaround();
+
         adaptivePlayback = MediaCodecHelper.decoderSupportsAdaptivePlayback(selectedDecoderInfo, mimeType);
         fusedIdrFrame = MediaCodecHelper.decoderSupportsFusedIdrFrame(selectedDecoderInfo, mimeType);
 
@@ -881,6 +887,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         throw new RendererException(this, e);
                     }
                 }
+
+                // Start a fresh observation window after recovery, including while waiting for IDR.
+                outputWatchdog.reset();
 
                 // Wake all quiesced threads and allow them to begin work again
                 codecRecoveryThreadQuiescedFlags = 0;
@@ -1109,6 +1118,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         // Try to output a frame
                         int outIndex = videoDecoder.dequeueOutputBuffer(info, 50000);
                         if (outIndex >= 0) {
+                            outputWatchdog.reset();
                             long presentationTimeUs = info.presentationTimeUs;
                             int lastIndex = outIndex;
 
@@ -1119,6 +1129,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 // Get the last output buffer in the queue
                                 while ((outIndex = videoDecoder.dequeueOutputBuffer(info, 0)) >= 0) {
                                     videoDecoder.releaseOutputBuffer(lastIndex, false);
+                                    outputWatchdog.reset();
 
                                     numFramesOut++;
 
@@ -1397,6 +1408,30 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             // We need a new buffer now
             nextInputBufferIndex = -1;
             nextInputBuffer = null;
+
+            // The Amlogic driver can silently discard every frame while still returning input
+            // buffers. Neither input-buffer hang detection nor CodecException recovery sees it.
+            // Ignore CSD: only successfully submitted picture data proves input is progressing.
+            if (outputWatchdogEnabled && (codecFlags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 &&
+                    outputWatchdog.onInput(SystemClock.uptimeMillis())) {
+                synchronized (codecRecoveryMonitor) {
+                    // Serialize with prepareForStop() so shutdown cannot leave a new recovery pending.
+                    if (!stopping && codecRecoveryType.get() == CR_RECOVERY_TYPE_NONE) {
+                        if (codecRecoveryAttempts >= CR_MAX_TRIES) {
+                            DecoderHungException exception = new DecoderHungException(2000);
+                            if (!reportedCrash) {
+                                reportedCrash = true;
+                                crashListener.notifyCrash(exception);
+                            }
+                            throw new RendererException(this, exception);
+                        }
+                        if (codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_NONE, CR_RECOVERY_TYPE_RESET)) {
+                            LimeLog.warning("Amlogic HEVC output stalled for 2 seconds while input continues; " +
+                                    "resetting decoder and requesting IDR");
+                        }
+                    }
+                }
+            }
         } catch (IllegalStateException e) {
             if (handleDecoderException(e)) {
                 // We encountered a transient error. In this case, just hold onto the buffer
